@@ -34,7 +34,7 @@ if __name__ == '__main__':
         settings.CIFAR100_TRAIN_MEAN,
         settings.CIFAR100_TRAIN_STD,
         #settings.CIFAR100_PATH,
-        num_workers=4,
+        num_workers=args.workers,
         batch_size=args.b,
     )
 

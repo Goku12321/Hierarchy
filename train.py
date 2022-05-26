@@ -25,12 +25,31 @@ from torch.utils.tensorboard import SummaryWriter
 from conf import settings
 from utils import get_network, get_training_dataloader, get_test_dataloader, WarmUpLR, \
     most_recent_folder, most_recent_weights, last_epoch, best_acc_weights
+from hier_tree.tree import Tree, CIFFAR100_HIER_CLASSES
+from anytree import LevelGroupOrderIter, PreOrderIter
+
+CIFFAR100_hier_classes = CIFFAR100_HIER_CLASSES()
+CIFFAR100_tree = Tree(CIFFAR100_hier_classes.cifar100_dict)
+
+def hier_loss(outputs, labels):
+    nls = torch.zeros(outputs.size()).cuda()  # nls: Negative Log Softmax
+    if args.gpu:
+        nls = nls.cuda()
+    for i, l in enumerate(labels):
+        for j in CIFFAR100_tree.tree_path[l.item()]:
+            nls[i:i + 1, CIFFAR100_tree.siblings[j]] = -log_softmax(outputs[i:i + 1, CIFFAR100_tree.siblings[j]])
+    hot_vector = CIFFAR100_tree.one_hot_vector(labels)
+    if args.gpu:
+        hot_vector = hot_vector.cuda()
+    return (hot_vector * nls).sum()
 
 def train(epoch):
-
     start = time.time()
     net.train()
+
     for batch_index, (images, labels) in enumerate(cifar100_training_loader):
+        if args.hier:
+            labels = torch.LongTensor([mapping_indices[label] for label in labels])
 
         if args.gpu:
             labels = labels.cuda()
@@ -38,7 +57,21 @@ def train(epoch):
 
         optimizer.zero_grad()
         outputs = net(images)
-        loss = loss_function(outputs, labels)
+
+        if args.hier:
+            # nls = torch.zeros(outputs.size()).cuda() #nls: Negative Log Softmax
+            # if args.gpu:
+            #     nls = nls.cuda()
+            # for i, l in enumerate(labels):
+            #     for j in CIFFAR100_tree.tree_path[l.item()]:
+            #         nls[i:i+1, CIFFAR100_tree.siblings[j]] = -log_softmax(outputs[i:i+1, CIFFAR100_tree.siblings[j]])
+            # hot_vector = CIFFAR100_tree.one_hot_vector(labels)
+            # if args.gpu:
+            #     hot_vector = hot_vector.cuda()
+            # loss = (hot_vector * nls).sum()
+            loss = hier_loss(outputs, labels)
+        else:
+            loss = cross_entropy(outputs, labels)
         loss.backward()
         optimizer.step()
 
@@ -73,9 +106,11 @@ def train(epoch):
     finish = time.time()
 
     print('epoch {} training time consumed: {:.2f}s'.format(epoch, finish - start))
+    writer.add_scalar('Train/lr', optimizer.param_groups[0]['lr'], epoch)
+
 
 @torch.no_grad()
-def eval_training(epoch=0, tb=True):
+def eval_training(epoch=0, hier=False, tb=True):
 
     start = time.time()
     net.eval()
@@ -84,17 +119,43 @@ def eval_training(epoch=0, tb=True):
     correct = 0.0
 
     for (images, labels) in cifar100_test_loader:
-
         if args.gpu:
             images = images.cuda()
             labels = labels.cuda()
 
         outputs = net(images)
-        loss = loss_function(outputs, labels)
+        loss = cross_entropy(outputs, labels)
 
         test_loss += loss.item()
-        _, preds = outputs.max(1)
-        correct += preds.eq(labels).sum()
+
+        if args.hier:
+            level_indices = []
+            for i, level in enumerate(LevelGroupOrderIter(CIFFAR100_tree.root)):
+                if i == 0:
+                    continue
+                level_indices.append([node.index for node in level])
+
+            # softmax to all siblings groups
+            probs = torch.zeros(outputs.size()).cuda()
+            for s in CIFFAR100_tree.siblings_groups:
+                probs[:, s] = softmax(outputs[:, s])
+
+            CIFFAR100_tree.root.prob = torch.ones([outputs.size(0), 1]).cuda()
+            for i, node in enumerate(PreOrderIter(CIFFAR100_tree.root)):
+                if i == 0: # first node doesn't have parent
+                    continue
+                parent = node.ancestors[-1]
+                node.prob = (probs[:, node.index].unsqueeze(1) * parent.prob).cuda()
+
+            hier_labels = CIFFAR100_tree.make_hier_labels(labels)
+            # for each level get the max
+            for indices in level_indices:
+                print(probs[:, indices].size())
+                _, preds = probs[:, indices].max(1)
+                print(torch.tensor(indices)[preds])
+        else:
+            _, preds = outputs.max(1)
+            correct += preds.eq(labels).sum()
 
     finish = time.time()
     if args.gpu:
@@ -116,12 +177,79 @@ def eval_training(epoch=0, tb=True):
 
     return correct.float() / len(cifar100_test_loader.dataset)
 
+
+@torch.no_grad()
+def eval_training_hier(epoch=0, hier=False, tb=True):
+    start = time.time()
+    net.eval()
+
+
+    test_loss = 0.0  # cost function error
+    correct_per_level = torch.zeros(len(CIFFAR100_tree.level_indices))
+
+    for (images, labels) in cifar100_test_loader:
+        if args.gpu:
+            images = images.cuda()
+            labels = torch.LongTensor([mapping_indices[label] for label in labels]) .cuda()
+
+        outputs = net(images)
+        loss = hier_loss(outputs, labels)
+
+        test_loss += loss.item()
+
+        # softmax to all siblings groups
+        probs_cond = torch.zeros(outputs.size()).cuda()
+        probs = torch.zeros(outputs.size()).cuda()
+        for s in CIFFAR100_tree.siblings_groups:
+            probs_cond[:, s] = softmax(outputs[:, s])
+
+        CIFFAR100_tree.root.prob = torch.ones([outputs.size(0), 1]).cuda()
+        for i, node in enumerate(PreOrderIter(CIFFAR100_tree.root)):
+            if i == 0:  # first node doesn't have parent
+                continue
+            parent = node.ancestors[-1]
+            node.prob = (probs_cond[:, node.index].unsqueeze(1) * parent.prob).cuda()
+            probs[:, node.index] = node.prob.squeeze()
+
+        hier_labels = CIFFAR100_tree.make_hier_labels(labels)
+        # for each level get the max
+        for i,indices in enumerate(CIFFAR100_tree.level_indices):
+            # print(probs[:, indices].size())
+            _, preds = probs[:, indices].max(1)
+            preds = torch.tensor(indices)[preds]
+            correct_per_level[i] += preds.eq(hier_labels[:,i]).sum()
+
+
+    finish = time.time()
+    if args.gpu:
+        print('GPU INFO.....')
+        print(torch.cuda.memory_summary(), end='')
+    print('Evaluating Network.....')
+    print(f'Test set: Epoch: {epoch}, Average loss: {len(cifar100_test_loader.dataset):.4f}', end=', ')
+    for i, corrects in enumerate(correct_per_level):
+        print(f'Accuracy Level {i+1}: {corrects.item()/len(cifar100_test_loader.dataset):.4f}', end=', ')
+
+
+    print(f'Time consumed:{finish - start:.2f}s')
+
+    # add informations to tensorboard
+    if tb:
+        writer.add_scalar('Test/Average loss', test_loss / len(cifar100_test_loader.dataset), epoch)
+        for i,corrects in enumerate(correct_per_level):
+            writer.add_scalar(f'Test/Accuracy Level {i+1}', corrects.item()/len(cifar100_test_loader.dataset), epoch)
+
+
+    return correct_per_level[-1].item() / len(cifar100_test_loader.dataset)
+
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-net', type=str, required=True, help='net type')
     parser.add_argument('-gpu', action='store_true', default=False, help='use gpu or not')
+    parser.add_argument('-hier', action='store_true', default=False, help='hierarchy classification or not')
     parser.add_argument('-b', type=int, default=128, help='batch size for dataloader')
+    parser.add_argument('-workers', type=int, default=0, help='0 for debug, 4 for running is recommended')
     parser.add_argument('-warm', type=int, default=1, help='warm up training phase')
     parser.add_argument('-lr', type=float, default=0.1, help='initial learning rate')
     parser.add_argument('-resume', action='store_true', default=False, help='resume training')
@@ -133,20 +261,31 @@ if __name__ == '__main__':
     cifar100_training_loader = get_training_dataloader(
         settings.CIFAR100_TRAIN_MEAN,
         settings.CIFAR100_TRAIN_STD,
-        num_workers=4,
+        num_workers=args.workers,
         batch_size=args.b,
         shuffle=True
     )
+
 
     cifar100_test_loader = get_test_dataloader(
         settings.CIFAR100_TRAIN_MEAN,
         settings.CIFAR100_TRAIN_STD,
-        num_workers=4,
+        num_workers=args.workers,
         batch_size=args.b,
         shuffle=True
     )
 
-    loss_function = nn.CrossEntropyLoss()
+    if args.hier:
+        # create labels mapping
+        mapping_indices = [-1] * 120
+        for i, cls in enumerate(cifar100_training_loader.dataset.class_to_idx):
+            mapping_indices[i] = CIFFAR100_tree.get_node_by_name(cls).index
+
+    cross_entropy = nn.CrossEntropyLoss()
+    cross_entropy_no_red = nn.CrossEntropyLoss(reduction='none')
+    softmax = nn.Softmax(dim=1)
+    log_softmax = nn.LogSoftmax(dim=1)
+    nlll = nn.NLLLoss(reduction='none')
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
     train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
     iter_per_epoch = len(cifar100_training_loader)
@@ -209,8 +348,9 @@ if __name__ == '__main__':
             if epoch <= resume_epoch:
                 continue
 
+        # ----------------------- train epoch -----------------------
         train(epoch)
-        acc = eval_training(epoch)
+        acc = eval_training_hier(epoch)
 
         #start to save best performance model after learning rate decay to 0.01
         if epoch > settings.MILESTONES[1] and best_acc < acc:

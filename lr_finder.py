@@ -54,7 +54,7 @@ if __name__ == '__main__':
     cifar100_training_loader = get_training_dataloader(
         settings.CIFAR100_TRAIN_MEAN,
         settings.CIFAR100_TRAIN_STD,
-        num_workers=4,
+        num_workers=args.workers,
         batch_size=args.b,
     )
 
