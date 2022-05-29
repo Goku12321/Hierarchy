@@ -43,6 +43,30 @@ def hier_loss(outputs, labels):
         hot_vector = hot_vector.cuda()
     return (hot_vector * nls).sum()
 
+def hier_loss_softmax(outputs, labels):
+    softmax_siblings = torch.zeros(outputs.size()).cuda()
+    loss_matrix = torch.zeros(outputs.size()).cuda()
+    if args.gpu:
+        softmax_siblings = softmax_siblings.cuda()
+    for i, l in enumerate(labels):
+        softmax_temp = 1
+        for j in CIFFAR100_tree.tree_path[l.item()]:
+            softmax_siblings[i:i + 1, CIFFAR100_tree.siblings[j]] = softmax(outputs[i:i + 1, CIFFAR100_tree.siblings[j]])
+            # loss_matrix[i:i + 1, j] = -torch.log(softmax_siblings[i:i + 1, j]) * softmax_temp
+            # # loss_matrix[i:i + 1, j] = softmax_siblings[i:i + 1, j] * softmax_temp
+            # softmax_temp *= softmax_siblings[i:i + 1, j].detach().item()
+    minus_log_softmax_siblings = -torch.log(softmax_siblings)
+
+    for i, l in enumerate(labels):
+        softmax_temp = 1
+        for j in CIFFAR100_tree.tree_path[l.item()]:
+            loss_matrix[i:i + 1, j] = minus_log_softmax_siblings[i:i + 1, j] * softmax_temp
+            softmax_temp *= softmax_siblings[i:i + 1, j].detach().item()
+    hot_vector = CIFFAR100_tree.one_hot_vector(labels)
+    if args.gpu:
+        hot_vector = hot_vector.cuda()
+    return (hot_vector * loss_matrix).sum()
+
 def train(epoch):
     start = time.time()
     net.train()
@@ -59,17 +83,8 @@ def train(epoch):
         outputs = net(images)
 
         if args.hier:
-            # nls = torch.zeros(outputs.size()).cuda() #nls: Negative Log Softmax
-            # if args.gpu:
-            #     nls = nls.cuda()
-            # for i, l in enumerate(labels):
-            #     for j in CIFFAR100_tree.tree_path[l.item()]:
-            #         nls[i:i+1, CIFFAR100_tree.siblings[j]] = -log_softmax(outputs[i:i+1, CIFFAR100_tree.siblings[j]])
-            # hot_vector = CIFFAR100_tree.one_hot_vector(labels)
-            # if args.gpu:
-            #     hot_vector = hot_vector.cuda()
-            # loss = (hot_vector * nls).sum()
-            loss = hier_loss(outputs, labels)
+            # loss = hier_loss(outputs, labels)
+            loss = hier_loss_softmax(outputs, labels)
         else:
             loss = cross_entropy(outputs, labels)
         loss.backward()
@@ -127,35 +142,8 @@ def eval_training(epoch=0, hier=False, tb=True):
         loss = cross_entropy(outputs, labels)
 
         test_loss += loss.item()
-
-        if args.hier:
-            level_indices = []
-            for i, level in enumerate(LevelGroupOrderIter(CIFFAR100_tree.root)):
-                if i == 0:
-                    continue
-                level_indices.append([node.index for node in level])
-
-            # softmax to all siblings groups
-            probs = torch.zeros(outputs.size()).cuda()
-            for s in CIFFAR100_tree.siblings_groups:
-                probs[:, s] = softmax(outputs[:, s])
-
-            CIFFAR100_tree.root.prob = torch.ones([outputs.size(0), 1]).cuda()
-            for i, node in enumerate(PreOrderIter(CIFFAR100_tree.root)):
-                if i == 0: # first node doesn't have parent
-                    continue
-                parent = node.ancestors[-1]
-                node.prob = (probs[:, node.index].unsqueeze(1) * parent.prob).cuda()
-
-            hier_labels = CIFFAR100_tree.make_hier_labels(labels)
-            # for each level get the max
-            for indices in level_indices:
-                print(probs[:, indices].size())
-                _, preds = probs[:, indices].max(1)
-                print(torch.tensor(indices)[preds])
-        else:
-            _, preds = outputs.max(1)
-            correct += preds.eq(labels).sum()
+        _, preds = outputs.max(1)
+        correct += preds.eq(labels).sum()
 
     finish = time.time()
     if args.gpu:
@@ -198,18 +186,9 @@ def eval_training_hier(epoch=0, hier=False, tb=True):
         test_loss += loss.item()
 
         # softmax to all siblings groups
-        probs_cond = torch.zeros(outputs.size()).cuda()
-        probs = torch.zeros(outputs.size()).cuda()
-        for s in CIFFAR100_tree.siblings_groups:
-            probs_cond[:, s] = softmax(outputs[:, s])
+        probs_cond = siblings_softmax(outputs)
 
-        CIFFAR100_tree.root.prob = torch.ones([outputs.size(0), 1]).cuda()
-        for i, node in enumerate(PreOrderIter(CIFFAR100_tree.root)):
-            if i == 0:  # first node doesn't have parent
-                continue
-            parent = node.ancestors[-1]
-            node.prob = (probs_cond[:, node.index].unsqueeze(1) * parent.prob).cuda()
-            probs[:, node.index] = node.prob.squeeze()
+        probs = nodes_probabilites(probs_cond)
 
         hier_labels = CIFFAR100_tree.make_hier_labels(labels)
         # for each level get the max
@@ -240,6 +219,39 @@ def eval_training_hier(epoch=0, hier=False, tb=True):
 
 
     return correct_per_level[-1].item() / len(cifar100_test_loader.dataset)
+
+
+def nodes_probabilites(probs_cond):
+    """
+      Args:
+          probs_cond: the softmax siblings output  - tensor (batch_size, nodes_num) shape
+
+      Returns: tensor with same shape with probability for each label in the hierarchy tree
+
+      """
+    CIFFAR100_tree.root.prob = torch.ones([probs_cond.size(0), 1]).cuda()
+    probs = torch.zeros(probs_cond.size()).cuda()
+    for i, node in enumerate(PreOrderIter(CIFFAR100_tree.root)):
+        if i == 0:  # first node doesn't have parent
+            continue
+        parent = node.ancestors[-1]
+        node.prob = (probs_cond[:, node.index].unsqueeze(1) * parent.prob).cuda()
+        probs[:, node.index] = node.prob.squeeze()
+    return probs
+
+
+def siblings_softmax(outputs):
+    """
+    Args:
+        outputs: the model outputs - tensor (batch_size, nodes_num) shape
+
+    Returns: tensor with same shape with softmax between siblings nodes
+
+    """
+    probs_cond = torch.zeros(outputs.size()).cuda()
+    for s in CIFFAR100_tree.siblings_groups:
+        probs_cond[:, s] = softmax(outputs[:, s])
+    return probs_cond
 
 
 if __name__ == '__main__':
@@ -350,7 +362,10 @@ if __name__ == '__main__':
 
         # ----------------------- train epoch -----------------------
         train(epoch)
-        acc = eval_training_hier(epoch)
+        if args.hier:
+            acc = eval_training_hier(epoch)
+        else:
+            acc = eval_training(epoch)
 
         #start to save best performance model after learning rate decay to 0.01
         if epoch > settings.MILESTONES[1] and best_acc < acc:
