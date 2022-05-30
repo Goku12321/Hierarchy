@@ -44,36 +44,45 @@ def hier_loss(outputs, labels):
     return (hot_vector * nls).sum()
 
 def hier_loss_softmax(outputs, labels):
-    softmax_siblings = torch.zeros(outputs.size()).cuda()
-    loss_matrix = torch.zeros(outputs.size()).cuda()
-    if args.gpu:
-        softmax_siblings = softmax_siblings.cuda()
-    for i, l in enumerate(labels):
-        softmax_temp = 1
-        for j in CIFFAR100_tree.tree_path[l.item()]:
-            softmax_siblings[i:i + 1, CIFFAR100_tree.siblings[j]] = softmax(outputs[i:i + 1, CIFFAR100_tree.siblings[j]])
-            # loss_matrix[i:i + 1, j] = -torch.log(softmax_siblings[i:i + 1, j]) * softmax_temp
-            # # loss_matrix[i:i + 1, j] = softmax_siblings[i:i + 1, j] * softmax_temp
-            # softmax_temp *= softmax_siblings[i:i + 1, j].detach().item()
+
+    softmax_siblings = softmax_sibling_by_labels(labels, outputs)
+
     minus_log_softmax_siblings = -torch.log(softmax_siblings)
 
-    for i, l in enumerate(labels):
-        softmax_temp = 1
-        for j in CIFFAR100_tree.tree_path[l.item()]:
-            loss_matrix[i:i + 1, j] = minus_log_softmax_siblings[i:i + 1, j] * softmax_temp
-            softmax_temp *= softmax_siblings[i:i + 1, j].detach().item()
+    loss_matrix = loss_cascaded_softmax(labels, minus_log_softmax_siblings, outputs, softmax_siblings)
+
     hot_vector = CIFFAR100_tree.one_hot_vector(labels)
     if args.gpu:
         hot_vector = hot_vector.cuda()
     return (hot_vector * loss_matrix).sum()
 
-def train(epoch):
+
+def loss_cascaded_softmax(labels, minus_log_softmax_siblings, outputs, softmax_siblings):
+    loss_matrix = torch.zeros(outputs.size()).cuda()
+    for i, l in enumerate(labels):
+        softmax_temp = 1
+        for j in CIFFAR100_tree.tree_path[l.item()]:
+            loss_matrix[i:i + 1, j] = minus_log_softmax_siblings[i:i + 1, j] * softmax_temp
+            softmax_temp *= softmax_siblings[i:i + 1, j].detach().item()
+    return loss_matrix
+
+
+def softmax_sibling_by_labels(labels, outputs):
+    softmax_siblings = torch.zeros(outputs.size()).cuda()
+    for i, l in enumerate(labels):
+        for j in CIFFAR100_tree.tree_path[l.item()]:
+            softmax_siblings[i:i + 1, CIFFAR100_tree.siblings[j]] = softmax(
+                outputs[i:i + 1, CIFFAR100_tree.siblings[j]])
+    return softmax_siblings
+
+
+def train(epoch, tb):
     start = time.time()
     net.train()
 
     for batch_index, (images, labels) in enumerate(cifar100_training_loader):
         if args.hier:
-            labels = torch.LongTensor([mapping_indices[label] for label in labels])
+            labels = torch.LongTensor([MAPPING_INDICES[label] for label in labels])
 
         if args.gpu:
             labels = labels.cuda()
@@ -93,11 +102,12 @@ def train(epoch):
         n_iter = (epoch - 1) * len(cifar100_training_loader) + batch_index + 1
 
         last_layer = list(net.children())[-1]
-        for name, para in last_layer.named_parameters():
-            if 'weight' in name:
-                writer.add_scalar('LastLayerGradients/grad_norm2_weights', para.grad.norm(), n_iter)
-            if 'bias' in name:
-                writer.add_scalar('LastLayerGradients/grad_norm2_bias', para.grad.norm(), n_iter)
+        if tb:
+            for name, para in last_layer.named_parameters():
+                if 'weight' in name:
+                    writer.add_scalar('LastLayerGradients/grad_norm2_weights', para.grad.norm(), n_iter)
+                if 'bias' in name:
+                    writer.add_scalar('LastLayerGradients/grad_norm2_bias', para.grad.norm(), n_iter)
 
         print('Training Epoch: {epoch} [{trained_samples}/{total_samples}]\tLoss: {:0.4f}\tLR: {:0.6f}'.format(
             loss.item(),
@@ -108,30 +118,37 @@ def train(epoch):
         ))
 
         #update training loss for each iteration
-        writer.add_scalar('Train/loss', loss.item(), n_iter)
+        if tb:
+            writer.add_scalar('Train/loss', loss.item(), n_iter)
 
         if epoch <= args.warm:
             warmup_scheduler.step()
-
-    for name, param in net.named_parameters():
-        layer, attr = os.path.splitext(name)
-        attr = attr[1:]
-        writer.add_histogram("{}/{}".format(layer, attr), param, epoch)
+    if tb:
+        for name, param in net.named_parameters():
+            layer, attr = os.path.splitext(name)
+            attr = attr[1:]
+            try:
+                writer.add_histogram("{}/{}".format(layer, attr), param, epoch)
+            except Exception as e:
+                print(e)
+                continue
 
     finish = time.time()
 
     print('epoch {} training time consumed: {:.2f}s'.format(epoch, finish - start))
-    writer.add_scalar('Train/lr', optimizer.param_groups[0]['lr'], epoch)
+    if tb:
+        writer.add_scalar('Train/lr', optimizer.param_groups[0]['lr'], epoch)
 
 
 @torch.no_grad()
-def eval_training(epoch=0, hier=False, tb=True):
+def eval_training(epoch=0, tb=True):
 
     start = time.time()
     net.eval()
 
     test_loss = 0.0 # cost function error
-    correct = 0.0
+    # correct = 0.0
+    correct_per_level = torch.zeros(len(CIFFAR100_tree.level_indices))
 
     for (images, labels) in cifar100_test_loader:
         if args.gpu:
@@ -143,42 +160,54 @@ def eval_training(epoch=0, hier=False, tb=True):
 
         test_loss += loss.item()
         _, preds = outputs.max(1)
-        correct += preds.eq(labels).sum()
+        # correct += preds.eq(labels).sum()
+
+
+        hier_labels = CIFFAR100_tree.make_hier_labels([MAPPING_INDICES[l] for l in labels])
+        hier_preds = CIFFAR100_tree.make_hier_labels([MAPPING_INDICES[l] for l in preds])
+        # for each level get the max
+        for i,indices in enumerate(CIFFAR100_tree.level_indices):
+            correct_per_level[i] += hier_preds[:, i].eq(hier_labels[:, i]).sum()
+        '''   
+        for level, indices in enumerate(CIFFAR100_tree.level_indices):
+            labels_level = [CIFFAR100_tree.tree_path[MAPPING_INDICES[j.item()]][level] for j in labels]
+            preds_level = [CIFFAR100_tree.tree_path[MAPPING_INDICES[j.item()]][level] for j in preds]
+            correct_per_level += preds_level.eq(labels_level).sum()
+        '''
 
     finish = time.time()
+    print(f'Eval time consumed:{finish - start:.2f}s')
     if args.gpu:
         print('GPU INFO.....')
         print(torch.cuda.memory_summary(), end='')
     print('Evaluating Network.....')
-    print('Test set: Epoch: {}, Average loss: {:.4f}, Accuracy: {:.4f}, Time consumed:{:.2f}s'.format(
-        epoch,
-        test_loss / len(cifar100_test_loader.dataset),
-        correct.float() / len(cifar100_test_loader.dataset),
-        finish - start
-    ))
-    print()
+
+    print(f'Test set flat: Epoch: {epoch}, Average loss: {test_loss / len(cifar100_test_loader.dataset):.4f}', end=', ')
+    for i, corrects in enumerate(correct_per_level):
+        print(f'Accuracy Level {i + 1}: {corrects.item() / len(cifar100_test_loader.dataset):.4f}', end=', ')
 
     #add informations to tensorboard
     if tb:
-        writer.add_scalar('Test/Average loss', test_loss / len(cifar100_test_loader.dataset), epoch)
-        writer.add_scalar('Test/Accuracy', correct.float() / len(cifar100_test_loader.dataset), epoch)
+        writer.add_scalars('Test/Average loss', {'flat': test_loss / len(cifar100_test_loader.dataset)}, epoch)
+        # writer.add_scalar('Test/Accuracy', {'flat':correct.float() / len(cifar100_test_loader.dataset)}, epoch)
+        for i, corrects in enumerate(correct_per_level):
+            writer.add_scalars(f'Test/Accuracy Level {i + 1}',
+                              {'flat': corrects.item() / len(cifar100_test_loader.dataset)}, epoch)
 
-    return correct.float() / len(cifar100_test_loader.dataset)
-
+    return correct_per_level[-1].item() / len(cifar100_test_loader.dataset)
 
 @torch.no_grad()
 def eval_training_hier(epoch=0, hier=False, tb=True):
     start = time.time()
     net.eval()
-
-
     test_loss = 0.0  # cost function error
     correct_per_level = torch.zeros(len(CIFFAR100_tree.level_indices))
+    counter_per_level = torch.zeros(len(CIFFAR100_tree.level_indices))
 
     for (images, labels) in cifar100_test_loader:
         if args.gpu:
             images = images.cuda()
-            labels = torch.LongTensor([mapping_indices[label] for label in labels]) .cuda()
+            labels = torch.LongTensor([MAPPING_INDICES[label] for label in labels]).cuda()
 
         outputs = net(images)
         loss = hier_loss(outputs, labels)
@@ -192,11 +221,12 @@ def eval_training_hier(epoch=0, hier=False, tb=True):
 
         hier_labels = CIFFAR100_tree.make_hier_labels(labels)
         # for each level get the max
+        # ToDo debugging and adding counter for each level
         for i,indices in enumerate(CIFFAR100_tree.level_indices):
             # print(probs[:, indices].size())
             _, preds = probs[:, indices].max(1)
             preds = torch.tensor(indices)[preds]
-            correct_per_level[i] += preds.eq(hier_labels[:,i]).sum()
+            correct_per_level[i] += preds.eq(hier_labels[:, i]).sum()
 
 
     finish = time.time()
@@ -204,7 +234,7 @@ def eval_training_hier(epoch=0, hier=False, tb=True):
         print('GPU INFO.....')
         print(torch.cuda.memory_summary(), end='')
     print('Evaluating Network.....')
-    print(f'Test set: Epoch: {epoch}, Average loss: {len(cifar100_test_loader.dataset):.4f}', end=', ')
+    print(f'Test set hier: Epoch: {epoch}, Average loss: {test_loss / len(cifar100_test_loader.dataset):.4f}', end=', ')
     for i, corrects in enumerate(correct_per_level):
         print(f'Accuracy Level {i+1}: {corrects.item()/len(cifar100_test_loader.dataset):.4f}', end=', ')
 
@@ -213,9 +243,9 @@ def eval_training_hier(epoch=0, hier=False, tb=True):
 
     # add informations to tensorboard
     if tb:
-        writer.add_scalar('Test/Average loss', test_loss / len(cifar100_test_loader.dataset), epoch)
+        writer.add_scalars('Test/Average loss', {'hier':test_loss / len(cifar100_test_loader.dataset)}, epoch)
         for i,corrects in enumerate(correct_per_level):
-            writer.add_scalar(f'Test/Accuracy Level {i+1}', corrects.item()/len(cifar100_test_loader.dataset), epoch)
+            writer.add_scalars(f'Test/Accuracy Level {i+1}', {'hier':corrects.item()/len(cifar100_test_loader.dataset)}, epoch)
 
 
     return correct_per_level[-1].item() / len(cifar100_test_loader.dataset)
@@ -265,6 +295,7 @@ if __name__ == '__main__':
     parser.add_argument('-warm', type=int, default=1, help='warm up training phase')
     parser.add_argument('-lr', type=float, default=0.1, help='initial learning rate')
     parser.add_argument('-resume', action='store_true', default=False, help='resume training')
+    parser.add_argument('-tb', action='store_true', default=False, help='save to tensorboard')
     args = parser.parse_args()
 
     net = get_network(args)
@@ -287,11 +318,10 @@ if __name__ == '__main__':
         shuffle=True
     )
 
-    if args.hier:
-        # create labels mapping
-        mapping_indices = [-1] * 120
-        for i, cls in enumerate(cifar100_training_loader.dataset.class_to_idx):
-            mapping_indices[i] = CIFFAR100_tree.get_node_by_name(cls).index
+    # create labels mapping
+    MAPPING_INDICES = [-1] * 120
+    for i, cls in enumerate(cifar100_training_loader.dataset.class_to_idx):
+        MAPPING_INDICES[i] = CIFFAR100_tree.get_node_by_name(cls).index
 
     cross_entropy = nn.CrossEntropyLoss()
     cross_entropy_no_red = nn.CrossEntropyLoss(reduction='none')
@@ -361,11 +391,12 @@ if __name__ == '__main__':
                 continue
 
         # ----------------------- train epoch -----------------------
-        train(epoch)
+        tb = args.tb
+        # train(epoch, tb=tb)
         if args.hier:
-            acc = eval_training_hier(epoch)
+            acc = eval_training_hier(epoch, tb=tb)
         else:
-            acc = eval_training(epoch)
+            acc = eval_training(epoch, tb=tb)
 
         #start to save best performance model after learning rate decay to 0.01
         if epoch > settings.MILESTONES[1] and best_acc < acc:
